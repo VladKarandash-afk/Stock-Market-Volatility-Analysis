@@ -1,0 +1,648 @@
+---
+title: "Projekt"
+author: "Mateusz Filipczyk, Vladyslav Karamushka"
+date: "2026-04-27"
+output: html_document
+---
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ggdist)
+library(nortest)
+library(knitr)
+library(tidyverse)
+
+long_dataset <- read.csv("long_dataset.csv")
+```
+```
+So at first we start with sampling the data. Key idea was to introduce day by day trading data from yahoo finance. For that we use following scripts.
+\textbf{stockpicking.py}, which transfers data from 2 csv files (sp500, stoxxEU600) to one file with headers \textbf{ticker, region, sector}. Then we normalize sector names (because they can not match for EU and US data), we do that in \textbf{cleaning sectors.py}. Following to that we check for data completness in \textbf{Datasetcheck.py}. However, data available may change, we also provide log of all the files we obtained using yf. Those log files are:
+\textbf{api_access_log.csv, iShared-STOXX-Europe-600, sp500_companies.csv}. Even though, entire code is replicable, the exact result may vary depending on date of access and available by that time historical data provided by yf. For our test we found problematic importing all data from europe. Thus the next step. In the following script we check, filter, and sample data from US (which will always be more complete), to sample of size which we have from overlapping sectors in US and EU. Thus we end up with data for 121 companies from US and EU with simillar sector coverage.
+```{r}
+library(dplyr)
+df_grp_ticker = long_dataset %>% distinct(ticker, region, sector) 
+df_grp_region = df_grp_ticker %>% group_by(region) %>% summarise(count = n(), .groups = 'drop')
+df_grp_region
+df_grp_ticker
+df_grp_sector = df_grp_ticker %>% group_by(region,sector) %>% summarize(count=n(), .groups = 'drop')
+df_grp_sector
+valid_sectors = df_grp_ticker %>% filter(region %in% c("EU","US")) %>% group_by(sector) %>%
+  summarise(n_regions = n_distinct(region), .groups = 'drop') %>% filter(n_regions==2)
+valid_sectors
+#after filtration
+df_filtered = df_grp_ticker %>% filter(sector %in% valid_sectors$sector)
+df_filtered
+df_filtered_region = df_filtered %>% group_by(region) %>% summarize(count=n(), .groups =  'drop')
+df_filtered_region
+df_filtered_sector = df_filtered %>% group_by(region, sector) %>% summarize(count = n(), .groups =  'drop')
+df_filtered_sector
+
+
+#sampling
+set.seed(42)
+n_sample <- 121
+# --- Compute allocation from EU counts ---
+eu_sector_counts <- df_filtered_sector %>%
+  filter(region == "EU")
+
+allocation <- eu_sector_counts %>%
+  mutate(
+    raw       = count / sum(count) * n_sample,
+    floor_n   = floor(raw),
+    remainder = raw - floor_n
+  ) %>%
+  arrange(desc(remainder)) %>%
+  mutate(
+    extra   = row_number() <= (n_sample - sum(floor_n)),
+    alloc_n = floor_n + as.integer(extra)
+  ) %>%
+  select(sector, alloc_n)
+
+# --- Sample US tickers per sector ---
+sampled_tickers <- df_filtered %>%
+  filter(region == "US") %>%
+  left_join(allocation, by = "sector") %>%
+  group_by(sector) %>%
+  group_modify(~ slice_sample(.x, n = unique(.x$alloc_n))) %>%
+  ungroup() %>%
+  select(ticker, sector)
+
+cat("Sampled", nrow(sampled_tickers), "US tickers\n")
+
+write.csv(sampled_tickers, "sampled_tickers.csv")
+
+long_dataset <- long_dataset %>% filter(region == "EU" | ticker %in% sampled_tickers$ticker)
+long_dataset <- long_dataset[long_dataset$sector != "cash and/or derivatives", ]
+```
+Now we have a dataset with 54015 observations of 15 variables. Number of observations per company may differ, but the difference cannot be bigger than 20, so it wont change results of the analysis significantly. 
+Firstly, we shall transform qualitative variables to a factor type, which will allow us implement analysis based on level of the variable. 
+```{r}
+long_dataset$cap_group <- as.factor(long_dataset$cap_group)
+long_dataset$region <- as.factor(long_dataset$region)
+long_dataset$sector <- as.factor(long_dataset$sector)
+```
+It also would be helpful to install and load libraries, such as \textbf{tidyverse} for easy data transformation, \textbf{ggplot} for data visualisation, \textbf{ggdist} for the half-violin plot and \textbf{nortest} for the Kolmogorov-Smirnov test function. 
+```{r}
+install.packages("tidyverse")
+library(tidyverse)
+install.packages("ggplot2")
+library(ggplot2)
+install.packages("ggdist")
+library(ggdist)
+install.packages("nortest")
+library(nortest)
+```
+
+#miejsce na opis zmiennych
+
+```{r quant-stats, echo=FALSE}
+quant_vars <- c("Close", "High", "Low", "Open", "Volume",
+                "return", "volatility", "market_cap", "log_market_cap")
+
+num_summary <- function(data, var, subset_label) {
+  data |>
+    summarise(
+      Subset = subset_label,
+      N      = n(),
+      Min    = min(.data[[var]], na.rm = TRUE),
+      Q25    = quantile(.data[[var]], 0.25, na.rm = TRUE),
+      Median = median(.data[[var]], na.rm = TRUE),
+      Mean   = mean(.data[[var]], na.rm = TRUE),
+      Q75    = quantile(.data[[var]], 0.75, na.rm = TRUE),
+      Max    = max(.data[[var]], na.rm = TRUE),
+      SD     = sd(.data[[var]], na.rm = TRUE)
+    )
+}
+
+quant_stats <- lapply(quant_vars, function(var) {
+  bind_rows(
+    num_summary(long_dataset,                          var, "All"),
+    num_summary(filter(long_dataset, region == "US"), var, "US"),
+    num_summary(filter(long_dataset, region == "EU"), var, "EU")
+  ) |> mutate(Variable = var, .before = 1)
+}) |> bind_rows()
+
+kable(quant_stats, digits = 2, 
+      format.args = list(big.mark = ",", scientific = FALSE),
+      caption = "Quantitative variables — summary statistics")
+```
+Looking at the summary statistics, the dataset contains 54,015 daily observations, split 
+roughly equally between US (27,709) and EU (26,306) stocks. The most visible difference 
+between the two regions is in price levels — US stocks have a mean closing price of $193.83 
+compared to $58.58 for EU stocks. This is likely driven by a combination of index composition 
+and the fact that European prices are quoted in euros, which tend to be nominally lower for 
+many listings. In both cases the median sits well below the mean, which points to 
+right-skewed distributions with some high-priced outliers pulling the average up.
+
+Trading volume also differs quite a lot between regions. The median daily volume for US 
+stocks is around 2.26 million shares, compared to just 419,000 for EU stocks. The EU 
+subsample also has a minimum volume of only 25 shares, which suggests there are some very 
+thinly traded securities in the European part of the sample.
+
+For returns, both regions are centered around zero as you would expect for daily financial 
+data. What stands out is how much wider the EU return range is — from −6.91 to 3.91 — 
+compared to US stocks which range from −0.46 to 0.21. The standard deviation is also 
+higher for EU stocks (0.08 vs 0.02), meaning there are more extreme return observations 
+in the European sample. Volatility tells a similar story, with the EU maximum reaching 
+1.54 against just 0.11 for US stocks.
+
+Market capitalisation is considerably larger for US companies on average ($114.96bn vs 
+$32.20bn for EU). The US maximum of $4.06tn reflects the presence of the largest American 
+technology companies in the sample. Because of this skewness, the log-transformed variable 
+is likely more useful for any further analysis, as it compresses the influence of these 
+very large firms.
+
+```{r quant-plots, echo=FALSE, fig.width=8, fig.height=4, message=FALSE, warning=FALSE}
+library(ggplot2)
+
+for (var in quant_vars) {
+  p <- ggplot(long_dataset, aes(x = .data[[var]], fill = region)) +
+    geom_histogram(
+      aes(y = after_stat(density)),
+      alpha    = 0.5,
+      position = "identity",
+      bins     = 50
+    ) +
+    labs(
+      title = paste("Distribution of", var),
+      x     = var,
+      y     = "Density",
+      fill  = "Region"
+    ) +
+    theme_minimal()
+  
+  print(p)
+}
+```
+The histograms largely confirm what the summary statistics suggested. All price variables 
+show a clear right skew, with most observations concentrated at lower values and a long 
+tail to the right. The US and EU distributions barely overlap, with European prices 
+sitting in a much narrower and lower range. For returns, both distributions look roughly 
+symmetric and centered around zero, though the EU histogram has noticeably fatter tails. 
+Volume is extremely skewed in both regions, which would probably warrant a log 
+transformation before using it in any regression. The same applies to market 
+capitalisation, which reinforces why the log version is included in the dataset.
+
+```{r qual-stats, echo=FALSE, message=FALSE, warning=FALSE, fig.width=8, fig.height=4}
+library(ggplot2)
+library(dplyr)
+library(knitr)
+
+
+ticker_level <- long_dataset |>
+  group_by(ticker) |>
+  slice(1) |>
+  ungroup()
+
+
+obs_per_ticker <- long_dataset |>
+  count(ticker, name = "n_obs")
+
+# Table: median, mean, sd of obs counts
+obs_stats <- obs_per_ticker |>
+  summarise(
+    Median = median(n_obs),
+    Mean   = mean(n_obs),
+    SD     = sd(n_obs)
+  )
+
+print(kable(obs_stats, digits = 2,
+            format.args = list(big.mark = ","),
+            caption     = "Observations per ticker — summary statistics"))
+
+# Chart: obs per ticker by region
+obs_per_ticker_region <- long_dataset |>
+  count(ticker, name = "n_obs") |>
+  left_join(ticker_level |> select(ticker, region), by = "ticker")
+
+p_obs <- ggplot(obs_per_ticker_region, aes(x = reorder(ticker, -n_obs), y = n_obs, fill = region)) +
+  geom_col() +
+  labs(
+    title = "Number of observations per ticker by region",
+    x     = "Ticker",
+    y     = "Number of observations",
+    fill  = "Region"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+print(p_obs)
+
+
+qual_stats <- bind_rows(
+  ticker_level |>
+    count(region, name = "N_tickers") |>
+    rename(Category = region) |>
+    mutate(Variable = "region", Region = "All", .before = 1),
+
+  ticker_level |>
+    count(region, sector, name = "N_tickers") |>
+    rename(Category = sector, Region = region) |>
+    mutate(Variable = "sector", .before = 1),
+
+  ticker_level |>
+    count(region, cap_group, name = "N_tickers") |>
+    rename(Category = cap_group, Region = region) |>
+    mutate(Variable = "cap_group", .before = 1)
+)
+
+print(kable(qual_stats,
+            format.args = list(big.mark = ","),
+            caption     = "Qualitative variables — ticker counts per category"))
+
+
+# region — simple bar
+p_region <- ticker_level |>
+  count(region) |>
+  ggplot(aes(x = reorder(region, -n), y = n, fill = region)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = n), vjust = -0.4, size = 3.5) +
+  labs(title = "Number of tickers by region", x = "Region", y = "Number of tickers") +
+  theme_minimal()
+
+print(p_region)
+
+# sector & cap_group
+for (var in c("sector", "cap_group")) {
+  p <- ticker_level |>
+    count(region, .data[[var]]) |>
+    ggplot(aes(x = reorder(.data[[var]], -n), y = n, fill = .data[[var]])) +
+    geom_col(show.legend = FALSE) +
+    geom_text(aes(label = n), vjust = -0.4, size = 3) +
+    facet_wrap(~region, scales = "free_x") +
+    labs(
+      title = paste("Number of tickers by", var, "(by region)"),
+      x     = var,
+      y     = "Number of tickers"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(p)
+}
+```
+
+Looking at the qualitative variables, there are some clear differences in how the two 
+regional subsamples are composed. On the US side, the vast majority of stocks are 
+large-cap (113 out of 121 tickers), with only 8 mid-cap companies and no small-cap 
+representation. This makes sense given that the S&P 500 is a large-cap index by 
+construction. The EU sample looks quite different — it is spread more evenly across 
+large (31), mid (31), and small-cap (35) stocks, with 24 tickers having an unknown 
+classification. This gives the EU subsample broader size coverage overall.
+
+In terms of sectors, the US breakdown shows industrials as the largest group with 24 
+tickers, followed by materials, real estate, and technology with 7 each, and utilities 
+with 6. This suggests the US sample was selected to cover different sectors rather than 
+to match the actual index weights.
+
+\section{Basic statistics}
+\section{Normality of return and volatility}
+Our analysis would be much easier if the key variables - return and volatility - were normally distributed. At the same time return of the stock exchange is very chaotic, so in reality our assumptions should be wrong. Let's take a look at the histogram of the return data, which will clearly show us that data is not normally distributed in case the data distribution is very different from normal. First, we should estimate parameters of the normal distribution. The maximum likelihood estimator of mean is sample mean and the maximum likelihood estimator of variance is $(n-1)/n$ times sample variance. 
+$$
+\hat\mu = \frac{1}{n}\sum_{i=1}^n X_i, \qquad \hat\sigma^2 = \frac{1}{n} \sum_{i=1}^n (X_i - \hat\mu)^2
+$$
+```{r}
+mu = mean(long_dataset$return)
+sigma2 = (nrow(long_dataset)-1)/nrow(long_dataset) * var(long_dataset$return)
+ggplot(long_dataset, aes(x = return)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 bins = 200, fill = "steelblue", color = "white", alpha = 0.7) +
+  
+  stat_function(fun = dnorm, 
+                args = list(mean = mu, sd = sqrt(sigma2)), 
+                color = "red", linewidth = 1.2, n = 1000) +
+  
+  theme_minimal() +
+  labs(title = "Return histogram and theoretical normal curve",
+       x = "Return", y = "Density") + 
+  coord_cartesian(xlim = c(-0.25, 0.25))
+```
+We can see that variance of the data is much bigger than it should be, which suggests existence of too many very extreme values for normal distribution.
+
+The best way to quickly refute assumption about being normally distributed is by looking on the QQ-plot of the variable.
+```{r}
+qqnorm(long_dataset$return)
+```
+Clearly there is no linear dependency between quantiles of the variable and quantiles of the normal distribution. We can see the "fat tails" property, where variable takes on extreme values with significantly bigger probability than variable with the normal distribution. 
+Let's check the "volatility" variable. Although "return" is very chaotic, the "volatility" is more stable. 
+```{r}
+qqnorm(long_dataset$volatility)
+```
+There is still clearly no linear dependency between quantiles, but one can see there graph of the exponential function. Remember that volatility as deviation of last returns is non-negative, so applying logarithm to variable is reasonable decision.
+```{r}
+qqnorm(log(long_dataset[long_dataset$volatility > 0, "volatility"]))
+```
+It is much closer to linear, but it is still not enough. This confirms Kolmogorov-Smirnov test results.
+```{r}
+lillie.test(long_dataset$volatility)
+```
+The p-value is so small that it is not represented in computer, so the distribution is definitely not normal. 
+
+The last reasonable attempt to get the normal distribution is to try choosing volatility only for the companies which belong to a "large" capital group, because their stocks are generally more stable than of the lesser companies. It is also recommended to choose observations which are not dependent on each other. Because "volatility" is calculated as the standard deviation of returns for the 20 days previous to this, observations which are separated by at least 20 days should be independent, so let's just choose every 20'th observation. Let's examine how an empirical cumulative distribution function is close to the CDF of the normal distribution with estimated parametres first, which will show whether "typical" behavior of the data is close to normal.
+```{r}
+large_vol <- long_dataset[long_dataset$cap_group == "large", "volatility"]
+log_large_vol <- log(large_vol[(1:nrow(long_dataset))*20])
+
+lv_mu = mean(log_large_vol)
+lv_sigma2 = (length(log_large_vol) - 1)/length(log_large_vol) * var(log_large_vol)
+
+df_lv <- data.frame(value = log_large_vol)
+df_lv_clean <- df_lv %>%
+  filter(is.finite(value))
+
+ggplot(df_lv_clean, aes(x = value)) +
+  stat_ecdf(geom = "step", color = "darkblue", linewidth = 1) +
+  stat_function(fun = pnorm, 
+                args = list(mean = lv_mu, sd = sqrt(lv_sigma2)), 
+                color = "red") +
+  theme_minimal() +
+  labs(title = "ECDF to the normal CDF comparison",
+       x = "Return", y = "ECDF")
+```
+We see that ECDF is so close to normal that the difference is not noticeable. 
+Next, we should examine the QQ-plot of the data, which will give more complete information about the distribution and will better show the difference in "tails" - extreme values.
+```{r}
+qqnorm(log_large_vol)
+```
+This time QQ-plot is very similar to linear, so we have a hope that we finally get the normally distributed data. But the results of the test don't fall for this trap and show us yet another negative result.
+```{r}
+lillie.test(log_large_vol)
+```
+Although this time p-value is much bigger, it is still very low, which tells us that the data clearly are not normally distributed.
+
+\section{Return behavior by sector}
+Now let`s examine one of the key variables - return - by sector. But before that it is necessary to remove outliers. Otherwise, plots could be unreadable. We know that the variable is not distributed normally, so we will remove observations which are defined as outliers during boxplot construction - those that are not in range $[Q1 - 1.5 \cdot IQR, Q3 + 1.5 \cdot IQR]$ where $Q1$ is the first quartile, $Q3$ is the third and $IQR = Q3 - Q1$. 
+```{r}
+q1 <- quantile(long_dataset$return, .25)
+q3 <- quantile(long_dataset$return, .75)
+blow <- q1 - 1.5 * (q3-q1) 
+bhigh <- q3 + 1.5 * (q3-q1)
+```
+The best way to visualise return by sector is by the violin plot, which will show the distribution of the variable for each level. We will also add the thin boxplot for the better understanding of the range where the most observations fall. 
+```{r}
+ggplot(long_dataset[long_dataset$return >= b1 & long_dataset$return <= b2, ], aes(x = sector, y = return, fill = sector)) +
+  geom_violin() + geom_boxplot(width = 0.1, fill = "white") + theme_minimal() + theme(axis.text.x = element_blank())
+```
+Those plots show "typical" behavior of the variable. Here one can see that the "communication" sector, though being one of the least stable, has the highest mean. The most unstable sectors are "energy" and "tech", which are still profitable. There is sector nearly as much profitable on average as the last ones, but more stable at the same time - "healthcare". The most stable sector is "utilities", which mean is very close to average "energy" and "healthcare" return. The least profitable sector is "consumer goods", and the second least profitable is "finance". 
+At the same time we have to remember that "return" is highly unstable variable with "fat tails", which implies that outliers are not very rare and happen time to time. It is worth to check how many observations we have cut in order to build violin plots.
+```{r}
+outliers_return <- long_dataset[long_dataset$return <= b1 | long_dataset$return >= b2, ]
+nrow(outliers_return)
+```
+We see that we have approximately 8% of observations cut, so the violin plots here gave us much information, but it would be better to not make assumptions based on just this information, Let's check how the parameters look like based on all observations.
+```{r}
+summary_stats_return <- long_dataset %>%
+  group_by(sector) %>%
+  summarise(
+    mean_ret = mean(return, na.rm = TRUE),
+    median_ret = median(return, na.rm = TRUE),
+    sd_ret = sd(return, na.rm = TRUE),     
+    n_obs = n()                                
+  )
+
+print(summary_stats_return)
+```
+As expected, outliers are changing some of our results significantly. We see that "healthcare" and "energy" have more than 1.5 times bigger mean than the rest, though standard deviation is average compared to other. At the same time, communication has average mean compared to other, second lowest standard deviation, but big difference between its mean and median. Analysing the medians (which correspond with "typical" behavior), we can confirm our assumptions about communication and healthcare sectors, though there are some outliers that are very low in communication, which means that rare very low values are possible. Energy sector, on the other hand, has one of the highest return values, but profit is less stable and there are as much very successful days as there are less than average or worse. In general, mean much lower than the median gives us information about a possibility of very low value. Other assumptions about "typical" behavior were close to reality.
+
+\section{Volatility examination by region}
+The next step in our analysis would naturally be to examine volatility by region. Since there are only two categories, we could test how similar the volatility is for every region by using statistical tests. But first, let's take a look at the half-violin plot (which is often called "raincloud plot") for the volatility by sector, because it is the best for quickly identifying data density and main parametres.
+Let's transform data for cleaner data visualisation.
+```{r}
+threshold_us <- quantile(long_dataset$volatility[long_dataset$region == "US"], 0.99, na.rm = TRUE)
+threshold_eu <- quantile(long_dataset$volatility[long_dataset$region == "EU"], 0.99, na.rm = TRUE)
+data_vol_cut <- long_dataset %>%
+  group_by(region) %>%
+  filter(
+    (region == "US" & volatility <= threshold_us) |
+    (region == "EU" & volatility <= threshold_eu)
+  ) %>%
+  ungroup()
+```
+That data will show "typical" variable behavior (volatility will take one of that value with a 99% probability). 
+```{r}
+ggplot(data_vol_cut, aes(x = region, y = volatility, fill = region, color = region)) +
+  
+  stat_halfeye(
+    adjust = 0.5, 
+    width = 0.6, 
+    .width = 0, 
+    justification = -0.2, 
+    point_colour = NA, 
+    alpha = 0.7
+  ) +
+  
+  geom_boxplot(
+    width = 0.15, 
+    outlier.shape = NA, 
+    alpha = 0.5, 
+    color = "black"
+  ) +
+  
+  coord_flip() + 
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Volatility distribution (trimmed by 99'th quantile)",
+    x = "Region", 
+    y = "Volatility"
+  )
+```
+Here one could see, that it is more unstable for the "EU" region, where it has highest mean and variance. Also from here it is seen that relatively many observations for the "EU" region are outliers, so it is reasonable to analyse main parametres for all data just as we did for the "return" variable.
+```{r}
+summary_stats_volatility <- long_dataset %>%
+  group_by(region) %>%
+  summarise(
+    mean_ret = mean(volatility, na.rm = TRUE),
+    median_ret = median(volatility, na.rm = TRUE),
+    sd_ret = sd(volatility, na.rm = TRUE),     
+    n_obs = n()                                
+  )
+
+print(summary_stats_volatility)
+```
+One can see that, although main indicator - median - is close in both categories, mean in "EU" is bigger and standard deviation is even bigger. This shows that main behavior is close for both samples, but in "EU" there is much more outliers, which is equal to frequently taking on extreme values.
+We already know that "volatility" nor its logarithmic transformation is normal, so standard t-Student test cannot be applied here. Instead, for examining whether "standard" (median) value is equal for both regions Mann-Whitney test should be used.
+```{r}
+wilcox.test(long_dataset$volatility[long_dataset$region == "US"], long_dataset$volatility[long_dataset$region == "EU"])
+```
+The p-value is so small that we can state, that "standard" volatility value is actually not equal.
+With all that information, it is clear that volatility distributions for different regions is not equal. One of the main reasons for this is a different numbers of companies for each capital group. As we already know, price for stock of lesser capital groups is more unstable than of greater ones. Therefore, it is reasonable to test volatility by region of the specific capital group.
+First, we should transform data similarly to the normality analysis to extract observations that correspond to "large" cap_group category.
+```{r}
+large_cap_data = data_vol_cut[data_vol_cut$cap_group == "large",]
+```
+
+```{r}
+ggplot(large_cap_data, aes(x = region, y = volatility, fill = region, color = region)) +
+  
+  stat_halfeye(
+    adjust = 0.5, 
+    width = 0.6, 
+    .width = 0, 
+    justification = -0.2, 
+    point_colour = NA, 
+    alpha = 0.7
+  ) +
+  
+  geom_boxplot(
+    width = 0.15, 
+    outlier.shape = NA, 
+    alpha = 0.5, 
+    color = "black"
+  ) +
+  
+  coord_flip() + 
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Volatility distribution for large cap_group",
+    x = "Region", 
+    y = "Volatility"
+  )
+```
+Here the volatility behavior from different regions is indeed much closer, though in EU there is still higher number of more volatile companies than in the US. So what is the result of the Mann-Whitney test?
+```{r}
+wilcox.test(large_cap_data$volatility[large_cap_data$region == "US"], large_cap_data$volatility[large_cap_data$region == "EU"])
+```
+The p-value is very small, so we can state that volatility on average is truly higher in EU.
+After analysing return by sector, it is also reasonable to examine volatility by sector. We can quickly examine volatility by both sector and region by looking on median in each group, which is more stable to extreme values than mean. The best way to understand how volatility changes in groups is to looking on heatmap.
+```{r}
+heatmap_data <- long_dataset %>%
+  group_by(region, sector) %>%
+  summarise(median_vol = median(volatility, na.rm = TRUE), .groups = "drop")
+
+ggplot(heatmap_data, aes(x = region, y = sector, fill = median_vol)) +
+  geom_tile(color = "white") +
+  
+  geom_text(aes(label = round(median_vol, 4)), color = "black", size = 3) +
+  
+  scale_fill_gradient(low = "white", high = "steelblue", name = "Volatility") +
+  
+  theme_minimal() +
+  labs(
+    title = "Volatility median heatmap",
+    x = "Sector",
+    y = "Region"
+  ) +
+  theme(panel.grid = element_blank())
+```
+Although 4 of the 10 sectors have higher volatility median in the US, the difference is not as big as for energy or tech sector for example, which have higher volatility median in EU. Therefore, we got another confirmation that volatility on average in EU is indeed bigger than in the US.
+At this heatmap, we also can see an interesting insight about "tech" being the most volatile and other sectors being significantly less unstable. This contradicts to part of our assumptions in the return analysis section, where it was stated that "energy" is the most unstable one, and communication being the third in this category. This shows that basic statistics analysis is not very good indicator and that we should do more exploratory analysis.
+
+\section{Correlation between volatility and volume}
+Next stage of our analysis is examining correlation between volatility and volume since they have similar behavior (non-negative for example) and it would be a reasonable assumption that they are correlated.
+Let's examine the scatter plot first with dashed line which represents the linear model build on our data. The plot will be cut to $[0, 10^7] \times [0, 0.1]$  domain for readability.
+```{r}
+ggplot(data_vol_cut, aes(x = volume, y = volatility)) +
+  geom_point(alpha = 0.3, size = 0.5) + 
+
+  geom_smooth(method = "lm", color = "red", linetype = "dashed") + 
+  
+  coord_cartesian(xlim = c(0, 10^7), ylim = c(0, 0.1)) +
+  
+  theme_minimal() +
+  labs(title = "Correlation vizualisation",
+       subtitle = "Dashed line shows general trend")
+```
+Here we can see week correlation between volume and volatility, it is really close to 0. Linear regression line is not a really good analysis technique here because of the high number of outliers. But here we also see an important property, namely heteroscedasticity, or changeability of the variance. The data spread narrows with increasing the volume number. One of the reasons is that the dataset has different companies, and biggest ones have very high volume, while most of the companies' volume is less, so naturally there are more companies on the left side than on the right side. There are still many observations on the right, so this isn't just property of chosen data, and there is clear trend. The market, although more volatile for bigger companies because of the higher stock demand, is much more vulnerable at low volume amount to unexpected events or appearance of the big player than market at high volume amount, where stocks with high liquidity are being trade, and one trade offer has to be very profitable to change the situation significantly. This phenomenon explains higher number of extreme values on the left side than on the right one.
+To confirm our assumptions, we can take a look at volatility for large capital group as previously.
+```{r}
+ggplot(large_cap_data, aes(x = volume, y = volatility)) +
+  geom_point(alpha = 0.3, size = 0.5) + 
+  
+  geom_smooth(method = "lm", color = "red", linetype = "dashed") + 
+  
+  coord_cartesian(xlim = c(0, 10^7), ylim = c(0, 0.07)) +
+  
+  theme_minimal() +
+  labs(title = "Correlation visualisation for large cap_group",
+       subtitle = "Dashed line shows general trend")
+```
+With data bound to the large capital group, we see that the data was mostly being cleared from heteroscedasticity. Also line here is much closer to the general trend. Now we can see that weak positive correlation does exist, so that would be our main assumption. It is confirmed by the results of the Spearman rank test.
+```{r}
+cor.test(large_cap_data$volatility, large_cap_data$volume, method = "spearman")
+```
+Although correlation is small, p-value is close to zero, therefore there is a correlation.
+
+\section{Linear model}
+The final step to round up our analysis is to build linear model. Financial data is very chaotic and don't have any standard distribution, which makes it very difficult to predict based on some general information. Entire departments in financial firms exist to control markets and build prediction models for a reason. So linear model here would be not as much about prediction (which is still not entirely pointless usage of this model) as it is describing impact of every factor on variable and its significance in general. 
+First, we need to choose variable that will be modeled. It is tempting to choose "return", but it is very unstable, is influenced by many factors every second and don't have simple approximation with a good normal distribution approximation. At the same time, volatility modeling seems much more reasonable, since it is slightly more stable, its logarithmic transformation could be not as badly approximated by normal distribution and naturally being closely connected to certain factors, such as volume, as we already know. So modelling volatility will be our objective.
+However, along with such good properties, volatility modelling comes with some problems. First problem is autocorrelation - every observation is correlated to 19 previous observations. Second problem is heteroscedasticity, which is related to the "memorisation" property, where it is returning to mean after some time, but still is highly influenced by previous observations. At the same time, despite not being normally distributed, with certain predictors' transfomations, we can achieve the state where it wont influence p-values too much. 
+Now we should create a column for logarithmised volatility data to lessen extreme values and make distribution close to normal and clear it from missing and infinite values.
+```{r}
+long_dataset$log_volatility <- log(long_dataset$volatility)
+long_dataset_clear <- long_dataset %>% filter(!is.na(log_volatility) & !is.infinite(log_volatility))
+```
+For higher model accuracy, it is also recommended to lessen outliers and values in general for every quantitative variable since they take on very high values. For market_cap it was already done, so let's do this for volume.
+```{r}
+long_dataset_clear$log_volume <- log(long_dataset_clear$volume)
+long_dataset_clear <- long_dataset_clear %>% filter(!is.na(log_volume) & !is.infinite(log_volume))
+```
+It is also worth mentioning that logarithmising quantitative variables will normalise their distribution, which is seen on histograms.
+```{r}
+ggplot(long_dataset_clear, aes(x = log_volume)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 bins = 100, fill = "steelblue", color = "white", alpha = 0.7) +
+  theme_minimal()
+```
+We should also remove extreme values of quantitative variables for higher model quality since very extreme values (ones that are marked as outliers even for the logarithmised data) could skew coefficients.
+```{r}
+long_dataset_clear_cut <- long_dataset_clear %>% 
+  filter(
+    log_volume >= quantile(log_volume, 0.01, na.rm = TRUE),
+    log_volume <= quantile(log_volume, 0.99, na.rm = TRUE),
+    
+    log_volatility >= quantile(log_volatility, 0.01, na.rm = TRUE),
+    log_volatility <= quantile(log_volatility, 0.99, na.rm = TRUE),
+    
+    log_market_cap >= quantile(log_market_cap, 0.01, na.rm= TRUE),
+    log_market_cap <= quantile(log_market_cap, 0.99, na.rm = TRUE)
+  )
+```
+The most important task hear is to "tame" autocorrelation of errors here. Let's take a look on dependency of current volatility on previous one.
+```{r}
+long_dataset_for_lm <- long_dataset_clear_cut %>%
+  arrange(region) %>%
+  group_by(ticker) %>%
+  mutate(log_prev_volatility = lag(log_volatility)) %>%
+  filter(!is.na(log_prev_volatility)) %>%
+  ungroup()
+
+ggplot(long_dataset_for_lm, aes(x = log_prev_volatility, y = log_volatility)) + geom_point(alpha = 0.3, size =   0.5) + geom_smooth(method = "lm", color = "red", linetype = "dashed") + 
+  theme_minimal() +
+  labs(title = "Correlation visualisation for previous observations",
+       subtitle = "Dashed line shows general trend")
+```
+Here we see that very strong linear dependency of current volatility on observation from previous day. Therefore, adding "log_prev_volatility" could reduce errors' autocorrelation in the model to minimum. There are ways to check it before building a model, but the subject is not called "probability", so we will continue with this and check the model quality later.
+Since volatility was calculated based on return, and return was calculated based on "open" and "close", and because of their unstability they will not be added to the model. 
+Now everything is ready for the linear model. Since current volatility and data from previous observations are highly correlated, our assumption is that log_prev_volatility will almost solely define log_volatility, but adding other variables is also very much reasonable to fully analyse factors' impact on volatility and to check hypotheses stated previously. 
+```{r}
+model <- lm(log_volatility ~ log_prev_volatility + log_market_cap + region + sector + log_volume, data = long_dataset_for_lm)
+
+summary(model)
+```
+Looking at regression results, first thing that attracts attention is that adjusted R-squared value is close to 1. Although this is not an indicator that our model is good, we can definitely say that it is not bad. Also, results are close to what was expected. As was stated, previous volatility value define the next almost entirely (almost 98% is defined by it). This confirms real phenomenon called "volatility clusterisation". At the same time, although it is very small, the market_cap and the volume do have impact on volatility: negative and positive respectively. Results correspond to larger companies being more stable and to assumptions in section with analysis of correlation between volatility and volume. Not only that, the impact of the region were confirmed, where US firms indeed have slight lower volatility number that of EU firms. What also was confirmed is the highest volatility on average in the "tech" sector. Two out of three analysis techniques showed this result, so we are naturally inclined to accept two conclusions: "tech" is indeed more volatile than others and analysing just the basic statistics is not enough and could give wrong answers. But high volatility in "healthcare" sector, which contradict with our analysis results done previously, we cannot trust based on just regression results because of the possible error autocorrelation: the p-value is not small enough. 
+The final step in the linear regression section is the diagnostics of our model. We already know that it is good enough to give somewhat reasonable results. But full diagnostics requires analysing diagnostics plots.
+```{r}
+plot(model, which = 1)
+```
+With the "Residuals vs Fitted" plot, we can clearly see two main insights. The good news are that the main residuals trend is horizontal and located at 0, so the linear dependency condition is met. The bad news are that heteroscedasticity, though is less visible, still exists, where for the lesser values it is low and slightly higher for other. That could mess up coefficients' p-values, but they are still so small that slight heteroscedasticity does not refute statement about impact existence of factors with at least 2 levels of p-value significance.
+```{r}
+plot(model, which = 2)
+mean(residuals(model))
+```
+The second plot is the residuals' QQ-plot. As expected, despite data having distribution close to normal, it is still not normal, and residuals do not have normal distribution either. Still their mean is very close to zero, so it should not influence coefficients estimation significantly.
+```{r}
+plot(model, which = 3)
+```
+The third plot is used for error homoscedasticity evaluation. Like in the second plot examination, we see that trend shows slight decrease with increasing values. The change is really low and variance increases significantly only where number of observations is low. This confirms that homoscedasticity should not change our interpretation significantly.
+```{r}
+plot(model, which = 5)
+```
+The "Residuals vs Leverage" plot is used to identify outliers. Here one can see that we have done really good job transforming our data, as out of 47000 observations only three were identified as outliers and they are still not very far from main data cloud. In this model extreme values is definitely not a problem.
