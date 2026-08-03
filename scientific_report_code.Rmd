@@ -1,0 +1,700 @@
+---
+title: "Stock Market Statistical Analysis"
+author: "Mateusz Filipczyk, Vladyslav Karamushka"
+date: "2026-04-27"
+output: 
+    html_document:
+      code_folding: hide
+---
+
+## Data Acquisition and Preprocessing
+
+The methodology begins with the collection of daily trading data from Yahoo Finance, subsequently aggregated using automated scripts. The *stockpicking.py* script merges data from the S&P 500 and STOXX Europe 600 indices into a unified dataset containing ticker symbols, regional identifiers, and sector classifications. To address discrepancies in sector naming between US and European markets, the *cleaning_sectors.py* script standardizes sector labels. The structural integrity and completeness of the resulting dataset are then verified using *Datasetcheck.py*.
+
+### Replicability and Methodological Limitations
+
+To promote transparency and reproducibility, all data retrieval activities are documented in log files, including *api_access_log.csv*, *iShared-STOXX-Europe-600.csv*, and *sp500_companies.csv*. Although the computational workflow is fully replicable, empirical results may exhibit minor temporal variations due to the dynamic nature of the Yahoo Finance API and limitations in historical data availability.
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ggdist)
+library(nortest)
+library(knitr)
+library(tidyverse)
+library(viridis)
+library(quantreg)
+library(scales)
+library(hexbin)
+
+long_dataset <- read.csv("long_dataset.csv")
+```
+
+### Sampling Strategy
+
+Empirical analysis indicated substantial missing data within the European cohort. To reduce potential bias and support comparability, a stratified sampling approach was adopted. The US dataset, characterized by high completeness, was systematically filtered and sampled to match the size and sector distribution of the European data. This procedure resulted in a final cross-regional sample of 121 companies from both the US and EU, ensuring balanced sector representation.
+
+```{r pipeline}
+df_grp_ticker = long_dataset %>% distinct(ticker, region, sector) 
+df_grp_region = df_grp_ticker %>% group_by(region) %>% summarise(count = n(), .groups = 'drop')
+df_grp_sector = df_grp_ticker %>% group_by(region,sector) %>% summarize(count=n(), .groups = 'drop')
+valid_sectors = df_grp_ticker %>% filter(region %in% c("EU","US")) %>% group_by(sector) %>%
+  summarise(n_regions = n_distinct(region), .groups = 'drop') %>% filter(n_regions==2)
+valid_sectors
+#after filtration
+df_filtered = df_grp_ticker %>% filter(sector %in% valid_sectors$sector)
+df_filtered_region = df_filtered %>% group_by(region) %>% summarize(count=n(), .groups =  'drop')
+df_filtered_sector = df_filtered %>% group_by(region, sector) %>% summarize(count = n(), .groups =  'drop')
+
+
+#sampling
+set.seed(42)
+n_sample <- 121
+# --- Compute allocation from EU counts ---
+eu_sector_counts <- df_filtered_sector %>%
+  filter(region == "EU")
+
+allocation <- eu_sector_counts %>%
+  mutate(
+    raw       = count / sum(count) * n_sample,
+    floor_n   = floor(raw),
+    remainder = raw - floor_n
+  ) %>%
+  arrange(desc(remainder)) %>%
+  mutate(
+    extra   = row_number() <= (n_sample - sum(floor_n)),
+    alloc_n = floor_n + as.integer(extra)
+  ) %>%
+  select(sector, alloc_n)
+
+# --- Sample US tickers per sector ---
+sampled_tickers <- df_filtered %>%
+  filter(region == "US") %>%
+  left_join(allocation, by = "sector") %>%
+  group_by(sector) %>%
+  group_modify(~ slice_sample(.x, n = unique(.x$alloc_n))) %>%
+  ungroup() %>%
+  select(ticker, sector)
+
+cat("Sampled", nrow(sampled_tickers), "US tickers\n")
+
+write.csv(sampled_tickers, "sampled_tickers.csv")
+
+long_dataset <- long_dataset %>% filter(region == "EU" | ticker %in% sampled_tickers$ticker)
+long_dataset <- long_dataset[long_dataset$sector != "cash and/or derivatives", ]
+```
+
+## Dataset Characteristics and Analytical Preparation
+
+The final dataset is organized as a panel with 54,015 observations across 15 variables. Although the panel is slightly unbalanced, the maximum difference in the number of observations per company does not exceed 20 periods. This variation is considered statistically negligible and is unlikely to materially affect the validity of subsequent analyses.
+
+Before statistical wrangling, all qualitative variables are converted into categorical factors to facilitate level-based analytical methods. The empirical framework then incorporates specialized software libraries for data transformation, advanced visualization (such as half-violin plots), and non-parametric statistical tests, specifically the Kolmogorov-Smirnov test for comparing distributions.
+
+```{r factor transformation}
+long_dataset$cap_group <- as.factor(long_dataset$cap_group)
+long_dataset$region <- as.factor(long_dataset$region)
+long_dataset$sector <- as.factor(long_dataset$sector)
+```
+
+## Summary Statistics Analysis
+
+```{r quant-stats, echo=FALSE}
+quant_vars <- c("Volume", "return", "volatility", "market_cap")
+
+num_summary <- function(data, var, subset_label) {
+  data |>
+    summarise(
+      Subset = subset_label,
+      N      = n(),
+      Min    = min(.data[[var]], na.rm = TRUE),
+      Median = median(.data[[var]], na.rm = TRUE),
+      Mean   = mean(.data[[var]], na.rm = TRUE),
+      Max    = max(.data[[var]], na.rm = TRUE),
+      SD     = sd(.data[[var]], na.rm = TRUE)
+    )
+}
+
+quant_stats <- lapply(quant_vars, function(var) {
+  bind_rows(
+    num_summary(long_dataset,                          var, "All"),
+    num_summary(filter(long_dataset, region == "US"), var, "US"),
+    num_summary(filter(long_dataset, region == "EU"), var, "EU")
+  ) |> mutate(Variable = var, .before = 1)
+}) |> bind_rows()
+
+kable(quant_stats, digits = 2, 
+      format.args = list(big.mark = ",", scientific = FALSE),
+      caption = "Quantitative variables — summary statistics")
+```
+
+The summary statistics reveal that the dataset comprises 54,015 daily observations, distributed nearly equally between US (27,709) and EU (26,306) stocks. The most notable distinction between the two regions lies in price levels: US stocks exhibit a mean closing price of $193.83, whereas EU stocks average $58.58. This disparity likely reflects both differences in index composition and the fact that European prices are denominated in euros, which are typically lower in nominal terms. In both markets, the median closing price is substantially below the mean, indicating right-skewed distributions with high-priced outliers elevating the average.
+
+Trading volume also varies significantly between regions. The median daily volume for US stocks is approximately 2.26 million shares, compared to just 419,000 for EU stocks. Notably, the minimum volume observed in the EU subsample is only 25 shares, indicating the presence of very thinly traded securities within the European dataset.
+
+Regarding returns, both regions are centered around zero, as expected for daily financial data. However, the range of returns for EU stocks is much broader (−6.91 to 3.91) than for US stocks (−0.46 to 0.21). The standard deviation is also higher for EU stocks (0.08 vs. 0.02), indicating a greater frequency of extreme return observations in the European sample. Volatility reflects a similar pattern, with the EU maximum reaching 1.54 compared to just 0.11 for US stocks.
+
+Market capitalisation is, on average, substantially larger for US companies ($114.96 billion) than for their EU counterparts ($32.20 billion). The maximum market capitalisation observed in the US sample is $4.06 trillion, reflecting the inclusion of major American technology firms. Due to this pronounced skewness, applying a logarithmic transformation to market capitalisation is likely to be more informative for subsequent analyses, as it reduces the disproportionate influence of extremely large companies.
+
+```{r quant-plots, echo=FALSE, fig.width=8, fig.height=4, message=FALSE, warning=FALSE}
+var = "log_market_cap"
+p <- ggplot(long_dataset, aes(x = .data[[var]], fill = region)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    alpha    = 0.5,
+    position = "identity",
+    bins     = 50
+  ) +
+  labs(
+    title = paste("Distribution of", var),
+    x     = var,
+    y     = "Density",
+    fill  = "Region"
+  ) +
+  theme_minimal()
+  
+print(p)
+```
+
+The histogram showing logarithmic transformation of market capitalisation largely corroborates the findings from the summary statistics. The mean market capitalisation remains notably higher in the US. Additionally, the logarithmic transformation of market capitalisation yields a distribution that is closer to normal and exhibits less deviation, suggesting that the US market is indeed more homogeneous compared to the EU.
+
+## Descriptive Statistics and Sample Composition
+
+```{r qual-stats, echo=FALSE, message=FALSE, warning=FALSE, fig.width=8, fig.height=4}
+ticker_level <- long_dataset |>
+  group_by(ticker) |>
+  slice(1) |>
+  ungroup()
+
+
+obs_per_ticker <- long_dataset |>
+  count(ticker, name = "n_obs")
+
+# Table: median, mean, sd of obs counts
+obs_stats <- obs_per_ticker |>
+  summarise(
+    Median = median(n_obs),
+    Mean   = mean(n_obs),
+    SD     = sd(n_obs)
+  )
+
+print(kable(obs_stats, digits = 2,
+            format.args = list(big.mark = ","),
+            caption     = "Observations per ticker — summary statistics"))
+
+# Chart: obs per ticker by region
+obs_per_ticker_region <- long_dataset |>
+  count(ticker, name = "n_obs") |>
+  left_join(ticker_level |> select(ticker, region), by = "ticker")
+
+# sector & cap_group
+var = "cap_group"
+p <- ticker_level |>
+  count(region, .data[[var]]) |>
+  ggplot(aes(x = reorder(.data[[var]], -n), y = n, fill = .data[[var]])) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = n), vjust = -0.4, size = 3) +
+  facet_wrap(~region, scales = "free_x") +
+  labs(
+    title = paste("Number of tickers by", var, "(by region)"),
+    x     = var,
+    y     = "Number of tickers"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p)
+```
+
+Analysis of the categorical variables reveals clear structural differences between the two regional subsamples. The US cohort is heavily skewed toward large-cap equities, with 113 out of 121 tickers classified as large-cap, only 8 as mid-cap, and none as small-cap. This concentration reflects the construction of the S&P 500, which is designed as a large-cap index. In contrast, the European subsample shows greater diversity, with a more balanced distribution across market capitalization categories: 31 large-cap, 31 mid-cap, and 35 small-cap equities, along with 24 firms for which capitalization is unclassified. As a result, the EU dataset offers a broader and more heterogeneous representation of firm sizes.
+
+In terms of sector allocation, the US subsample is primarily concentrated in Industrials (24 companies), with Materials, Real Estate, and Techn each represented by 7 companies, and Utilities by 6.
+
+## Distributional Analysis of Returns and Volatility
+
+Although assuming normality can greatly simplify econometric modeling, financial time series data are usually governed by more complex, non-Gaussian processes. To formally evaluate the distributional characteristics of the *return* variable, the analysis begins with a visual inspection using a histogram. The parameters of the theoretical normal distribution are estimated by Maximum Likelihood Estimation (MLE), with the population mean approximated by the sample mean, and the population variance estimated as $\frac{n-1}{n}$ times the sample variance.
+
+$$
+\hat\mu = \frac{1}{n}\sum_{i=1}^n X_i, \qquad \hat\sigma^2 = \frac{1}{n} \sum_{i=1}^n (X_i - \hat\mu)^2
+$$
+
+### Distribution of the Return Variable
+
+```{r return histogram}
+mu = mean(long_dataset$return)
+sigma2 = (nrow(long_dataset)-1)/nrow(long_dataset) * var(long_dataset$return)
+ggplot(long_dataset, aes(x = return)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 binwidth = 0.01, fill = "steelblue", color = "black", alpha = 0.7) +
+  
+  stat_function(fun = dnorm, 
+                args = list(mean = mu, sd = sqrt(sigma2)), 
+                color = "red", linewidth = 1.2, n = 1000) +
+  
+  labs(title = "Return histogram and theoretical normal curve",
+       x = "Return", y = "Density") + 
+  coord_cartesian(xlim = c(-0.25, 0.25)) +
+  theme_light() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+```
+
+The plot is showing histogram, representing distribution of the *return* variable, compared to the approximated normal distribution. The plot was bounded on x axis to $[-0.25, 0.25]$ range due to rare, but extreme values, which distrort clarity. The empirical variance is considerably higher than what would be expected under a normal distribution, indicating a significant presence of extreme outliers.
+
+To further assess the normality assumption, a Quantile-Quantile (Q-Q) plot is employed. The plot reveals a clear non-linear relationship between the empirical and theoretical quantiles of a normal distribution. In particular, the distribution displays pronounced leptokurtosis — commonly referred to as "fat tails" — which means that extreme deviations occur much more frequently than would be expected under a Gaussian model. 
+
+```{r qqplot return}
+qqnorm(long_dataset$return, main = "Return Q-Q plot")
+```
+
+### Distribution of the Volatility Variable
+
+```{r qqplot log_volatility}
+qqnorm(log(long_dataset[long_dataset$volatility > 0, "volatility"]), main = "Log-volatility Q-Q plot")
+```
+
+Analysis of the logarithmic transformation of the *volatility* variable shows relatively greater stability compared to the return series. Although the Q-Q plot for volatility appears closer to linear, it still does not meet the criteria for normality. This visual impression is supported by the Kolmogorov-Smirnov (K-S) test, which produces a p-value near zero — below machine precision thresholds — resulting in a clear rejection of the null hypothesis of normality.
+
+```{r ks test volatility}
+lillie.test(long_dataset$volatility[1:nrow(long_dataset)*20])
+```
+
+To rigorously test for normality under optimal conditions, the dataset is limited to the volatility of large-capitalization equities, based on the premise that large-cap stocks typically display lower idiosyncratic variance. In addition, to address autocorrelation introduced by the rolling window calculation — since volatility is computed as the standard deviation of returns over a trailing 20-day period — the data is systematically subsampled. By selecting every 20th observation, temporal overlap is avoided, satisfying the statistical assumption of independent and identically distributed (i.i.d.) observations.
+
+```{r qqplot log_large_vol}
+log_large_vol = log(long_dataset[long_dataset$cap_group == "large", ]$volatility)
+qqnorm(log_large_vol, main = "Log-volatility Q-Q plot for large cap_group")
+```
+
+Examining the revised Q-Q plot for this filtered, independent subsample shows a marked improvement, with empirical quantiles much more closely following the linear theoretical benchmark. However, despite this apparent visual alignment, the formal Kolmogorov-Smirnov test does not support the graphical intuition. While the calculated p-value is significantly higher than in earlier tests, it still falls below conventional significance thresholds. Thus, even after accounting for firm size and autocorrelation, the hypothesis that the volatility data are normally distributed is strongly rejected.
+
+```{r ks test log_large_vol}
+lillie.test(log_large_vol)
+```
+
+## Sectoral Analysis of Returns
+
+To enable clear graphical analysis of sectoral returns, extreme observations are addressed first to prevent visual distortion. Recognizing that returns are not normally distributed, outliers are identified using the standard interquartile range (IQR) method. Observations outside the range $[Q_1 - 1.5 \cdot IQR, Q_3 + 1.5 \cdot IQR]$ — where $Q_1$ and $Q_3$ denote the first and third quartiles — are systematically excluded from the initial visualizations.
+
+```{r trimming for violin plot}
+q1 <- quantile(long_dataset$return, .25)
+q3 <- quantile(long_dataset$return, .75)
+blow <- q1 - 1.5 * (q3-q1) 
+bhigh <- q3 + 1.5 * (q3-q1)
+
+data_for_violin <- long_dataset[long_dataset$return >= blow & long_dataset$return <= bhigh, ] %>%
+  mutate(sector = reorder(sector, return, median))
+```
+
+To effectively illustrate the distribution of returns across sectors, violin plots are used. These are overlaid with narrow boxplots to highlight the central tendency and the concentration of interquartile data, capturing the typical behavior of returns within each sector.
+
+```{r return by sector violin plot, echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(long_dataset[long_dataset$return >= blow & long_dataset$return <= bhigh, ], 
+       aes(x = sector, y = return, fill = sector)) +
+  geom_violin(alpha = 0.6, color = "black", trim = FALSE) + 
+  geom_boxplot(width = 0.1, fill = "white", color = "black", outlier.shape = NA, fatten = 1.5) + 
+  coord_flip() +
+  scale_fill_viridis_d(option = "plasma") +
+  labs(title = "Return by sector violin plot",
+       x = "Sector", y = "Return") + 
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(
+    title = "Return by Sector Distribution",
+    subtitle = "Sorted by median return. Red dots indicate mean value.",
+    x = "Sector",
+    y = "Return"
+  ) +
+  coord_cartesian(ylim = c(-0.03, 0.03))
+```
+
+Analysis of the trimmed dataset shows that the Communication sector, despite higher volatility, produces the highest mean return. The Energy and Tech sectors display the greatest variance but still maintain positive average returns. In contrast, the Healthcare sector delivers similar mean returns to these sectors but with much lower volatility, suggesting a more favorable risk-adjusted profile. The Utilities sector stands out as the most stable, generating mean returns similar to those of the Energy and Healthcare sectors. In comparison, the Consumer Goods and Finance sectors report the lowest relative profitability.
+
+```{r number of removed outliers}
+outliers_return <- long_dataset[long_dataset$return <= blow | long_dataset$return >= bhigh, ]
+cat("Number of observations being excluded from violin plot:", nrow(outliers_return))
+```
+
+It is important to note that financial returns often follow leptokurtic ("fat-tailed") distributions, meaning extreme values are statistically significant and occur with meaningful frequency. The IQR-based trimming process excluded about 8% of all observations. As a result, drawing firm conclusions from this restricted dataset alone introduces survivorship and truncation biases. A more complete assessment requires examining summary statistics from the full, unabridged dataset.
+
+```{r summary for return by sector}
+summary_stats_return <- long_dataset %>%
+  group_by(sector) %>%
+  summarise(
+    mean_ret = mean(return, na.rm = TRUE),
+    median_ret = median(return, na.rm = TRUE),
+    sd_ret = sd(return, na.rm = TRUE),     
+    n_obs = n()                                
+  )
+
+print(summary_stats_return)
+```
+
+Including extreme values significantly changes the descriptive statistics. In the unrestricted dataset, Healthcare and Energy sectors exhibit mean returns more than 1.5 times the cross-sector average, while maintaining moderate standard deviations. Notably, the Communication sector shows a marked difference between its mean and median, coupled with a relatively low standard deviation, indicating strong negative skewness due to extreme negative events.
+
+Analysis of the medians — which are more robust to outliers — supports the initial findings about the central tendencies in the Communication and Healthcare sectors. The Energy sector, while reporting some of the highest absolute returns, also exhibits substantial variance, reflecting a symmetric likelihood of both exceptional gains and significant losses. In summary, a large negative gap between the mean and median signals heightened left-tail risk, while the main behavioral patterns observed in the censored data remain valid for the central distribution.
+
+## Cross-Regional Volatility Analysis
+
+The next stage of the empirical analysis compares stock volatility between the two geographic regions. Since the regional variable is binary, formal statistical hypothesis testing is necessary to determine whether the variance distributions are equivalent. Before conducting these tests, an exploratory visual analysis is performed using a half-violin (raincloud) plot to illustrate the probability density and central tendencies of the volatility measures. Due to the high number of observations and the density of data points, the "rain" component was omitted from the plot to preserve clarity.
+
+To improve the clarity of the graphical representation and focus on the core stochastic behavior, the data are transformed (e.g., truncated) to retain 99% of the empirical probability mass. This approach highlights the typical volatility regime while reducing visual distortion from extreme tail events.
+
+```{r truncation for raincloud plot}
+# cutting data by 1st and 99th quantiles
+threshold_us <- quantile(long_dataset$volatility[long_dataset$region == "US"], 0.99, na.rm = TRUE)
+threshold_eu <- quantile(long_dataset$volatility[long_dataset$region == "EU"], 0.99, na.rm = TRUE)
+data_vol_cut <- long_dataset %>%
+  group_by(region) %>%
+  filter(
+    (region == "US" & volatility <= threshold_us) |
+    (region == "EU" & volatility <= threshold_eu)
+  ) %>%
+  ungroup()
+```
+
+```{r volatility by region raincloud plot}
+# half-violin "raincloud" plot
+ggplot(data_vol_cut, aes(x = region, y = volatility, fill = region, color = region)) +
+  
+# "cloud"
+  stat_halfeye(
+    adjust = 0.5, 
+    width = 0.6, 
+    .width = 0, 
+    justification = -0.2, 
+    point_colour = NA, 
+    alpha = 0.7
+  ) +
+  
+# boxplot
+  geom_boxplot(
+    width = 0.15, 
+    outlier.shape = NA, 
+    alpha = 0.5, 
+    color = "black"
+  ) +
+  
+  coord_flip() + 
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Volatility distribution (trimmed by 99'th quantile)",
+    x = "Region", 
+    y = "Volatility"
+  )
+```
+
+Visual inspection of the truncated data reveals greater instability in the European (EU) cohort, with higher mean and variance. The EU sample also shows a much higher frequency of extreme outliers. To avoid truncation bias, it is therefore necessary to examine summary statistics for the full, unabridged dataset, consistent with the approach used for the return variable.
+
+```{r volatility by region summary}
+summary_stats_volatility <- long_dataset %>%
+  group_by(region) %>%
+  summarise(
+    mean_ret = mean(volatility, na.rm = TRUE),
+    median_ret = median(volatility, na.rm = TRUE),
+    sd_ret = sd(volatility, na.rm = TRUE),     
+    n_obs = n()                                
+  )
+
+print(summary_stats_volatility)
+```
+
+Analysis of the unrestricted data shows that, although the medians—robust measures of central tendency are similar across both regions, the EU sample has a notably higher mean and standard deviation. This gap between the mean and median points to pronounced right-skewness in the EU data, indicating that while typical volatility is comparable, the EU market is more prone to extreme volatility shocks (tail events).
+
+As established earlier, neither the volatility variable nor its logarithmic transformation meets the assumption of normality, ruling out the use of parametric methods like the Student's t-test. Therefore, to formally test whether median volatility levels are equivalent across regions, a non-parametric approach — the Mann-Whitney U test (Wilcoxon rank-sum test) — is applied.
+
+```{r mann-whitney region difference test}
+volatility_us = long_dataset$volatility[long_dataset$region == "US"]
+volatility_eu = long_dataset$volatility[long_dataset$region == "EU"]
+wilcox.test(volatility_us[1:length(volatility_us)*20], volatility_eu[1:length(volatility_eu)*20])
+```
+
+The resulting p-value is close to zero, far below standard significance thresholds. This strongly rejects the null hypothesis and provides clear statistical evidence that the central distributions of volatility differ significantly between the US and EU markets.
+
+The empirical results clearly show that volatility distributions differ across regions. One key factor contributing to this divergence is the structural difference in market capitalization groups between the two samples. Financial literature demonstrates that small- and mid-cap stocks inherently exhibit higher idiosyncratic volatility than large-cap stocks (the size premium).
+
+Because the proportions of these capitalization groups differ across the US and EU, market size is a significant confounding variable. To isolate the true regional effect, subsequent analyses should control for market capitalization by evaluating volatility within specific size categories.
+
+## Cross-Sectional Analysis of Sectoral Volatility
+
+Building on the previous sectoral analysis of returns, a cross-sectional investigation of idiosyncratic volatility is conducted. To simultaneously assess volatility patterns across both sector and region, the median is used as the principal measure of central tendency. This choice reflects the median’s resilience to leptokurtic distributions and extreme tail events, which can significantly distort mean values in financial data. Distributional variance across these categorical dimensions is visualized using a bivariate heatmap matrix.
+
+```{r median volatility heatmap}
+# preparing data
+heatmap_data <- long_dataset %>%
+  group_by(region, sector) %>%
+  summarise(median_vol = median(volatility, na.rm = TRUE), .groups = "drop")
+
+ggplot(heatmap_data, aes(x = region, y = sector, fill = median_vol)) +
+  geom_tile(color = "white") +
+  
+  geom_text(aes(label = round(median_vol, 4)), color = "black", size = 3) +
+  
+  scale_fill_gradient(low = "white", high = "steelblue", name = "Volatility") +
+  
+  theme_minimal() +
+  labs(
+    title = "Volatility median heatmap",
+    x = "Sector",
+    y = "Region"
+  ) +
+  theme(panel.grid = element_blank())
+```
+
+Analysis of the heatmap shows that the US group has slightly higher median volatility in four out of ten sectors, though these differences are modest. In contrast, the Energy and Information Technology sectors display significantly higher median volatility in the European (EU) sample. The pronounced variance in these European sectors heavily influences the aggregate results, supporting earlier empirical findings that the EU market, on average, experiences systematically higher volatility than the US market.
+
+The multidimensional visualization also reveals a key structural insight: Tech stands out as the most volatile sector in the entire dataset, while the other sectors show significantly lower levels of systemic volatility.
+
+This contrast between standard and full-picture analyses underscores a key dynamic in financial data interpretation. While measures of 'standard behaviour' — such as the median — capture the typical market environment and suggest a relatively stable sectoral hierarchy, the presence of non-Gaussian distributions means that rare tail events can dramatically alter overall outcomes. As a result, relying exclusively on central tendency metrics risks understating the true extent of volatility and instability in certain sectors. These findings highlight the necessity of a comprehensive, multidimensional Exploratory Data Analysis (EDA) approach that considers both the central patterns and the critical impact of extreme events to fully understand complex market dynamics.
+
+## Bivariate Analysis of Volatility and Trading Volume
+
+The next phase of this empirical analysis examines the relationship between trading volume and asset volatility. Both measures are strictly non-negative, and foundational market microstructure theory provides a solid rationale for expecting a correlation between liquidity proxies (such as volume) and price variance.
+
+To visually assess this relationship, a scatter plot with an Ordinary Least Squares (OLS) regression line is produced. To maintain clarity and minimize distortion from extreme tail events, the plot domain is restricted to $[0, 10^7] \times [0, 0.1]$.
+
+```{r volatility and volume corelation plot, echo=FALSE, fig.width=8, fig.height=4, message=FALSE, warning=FALSE}
+data_cor <- data_vol_cut[data_vol_cut$volatility <= 0.1 & data_vol_cut$volume <= 10^7,]
+
+
+ggplot(data_cor, aes(x = volume, y = volatility)) +
+ geom_hex(binwidth = c(100000, 0.002)) +
+  
+  scale_fill_viridis_c(
+    option = "magma",
+    
+    breaks = function(x) c(min(x, na.rm = TRUE), max(x, na.rm = TRUE)),
+   
+    labels = c("Low density", "High density"), 
+    guide = guide_colorbar(
+      title = "Density",
+      ticks = FALSE, 
+      label.position = "right",
+      barheight = unit(5, "cm")
+    )
+  ) +
+  
+  geom_quantile(quantiles = c(0.05, 0.95), 
+                color = "royalblue", size = 0.75) +
+  
+  # Медиана (как в исходном графике)
+  geom_quantile(quantiles = 0.50, 
+                color = "red", linetype = "dashed", size = 1) +
+
+  labs(title = "Volatility and Volume Correlation Visualization",
+       subtitle = "Hexbin density and quantile regression lines reveal heteroscedasticity",
+       x = "Volume (M)",
+       y = "Volatility") +
+  
+  theme_minimal() +
+  
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "right") 
+```
+
+An initial visual assessment indicates a weakly positive, yet negligible, correlation. The prevalence of outliers further reduces the reliability of standard linear regression as a diagnostic in this setting. Importantly, the scatter plot highlights pronounced heteroscedasticity: as trading volume increases, the conditional variance of volatility systematically decreases.
+
+The funnel-shaped heteroscedasticity in the scatter plot reflects fundamental differences between large- and small-cap stocks. Large caps, which dominate the high-volume end, show higher average volatility due to active trading and constant price adjustment, but their deep liquidity buffers absorb routine shocks, making extreme volatility rare and typically requiring major external events. In contrast, small-cap stocks — prevalent among low-volume assets — tend to be more stable under normal conditions, yet their limited liquidity means even minor news or trades can lead to sharp, outsized price swings. This structure explains why low-volume assets exhibit a wide spread of volatility (with frequent extremes), while high-volume assets cluster tightly around a higher baseline but experience far fewer outlier events.
+
+To empirically validate this structural hypothesis and isolate the confounding effect of firm size, the dataset is subsequently restricted strictly to the large-capitalization cohort.
+
+```{r large_cap volatility and volume corelation plot, echo=FALSE, message=FALSE, warning=FALSE}
+large_cap_data = data_cor[data_cor$cap_group == "large",]
+
+ggplot(large_cap_data, aes(x = volume, y = volatility)) +
+  geom_hex(bins = 70) +
+  
+  scale_fill_viridis_c(
+    option = "magma",
+    
+    breaks = function(x) c(min(x, na.rm = TRUE), max(x, na.rm = TRUE)),
+   
+    labels = c("Low density", "High density"), 
+    guide = guide_colorbar(
+      title = "Density",
+      ticks = FALSE, 
+      label.position = "right",
+      barheight = unit(5, "cm")
+    )
+  ) +
+  
+  geom_quantile(quantiles = c(0.05, 0.95), 
+                color = "royalblue", 
+                linewidth = 0.75) +
+  
+  geom_quantile(quantiles = 0.50, 
+                color = "red", linetype = "dashed", linewidth = 1) +
+  
+  labs(title = "Volatility and Volume Correlation Visualization for large cap_group",
+       subtitle = "Heteroscedasticity is significantly lower in large companies",
+       x = "Volume (M)",
+       y = "Volatility") +
+  
+  theme_minimal() +
+  
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "right")
+```
+
+Within this standardized subgroup, heteroscedasticity is greatly reduced, and the regression line aligns more closely with the underlying trend, revealing a clear — though still weak — positive correlation. To more robustly quantify this monotonic relationship, and to account for the non-Gaussian nature of the data, a non-parametric Spearman's rank correlation coefficient ($\rho$) is calculated.
+
+```{r spearman test, echo=FALSE, message=FALSE, warning=FALSE}
+cor.test(large_cap_data$volatility[1:nrow(large_cap_data)*20], large_cap_data$volume[1:nrow(large_cap_data)*20], method = "spearman")
+```
+
+While the magnitude of the correlation coefficient remains relatively modest, the associated p-value is well below conventional significance thresholds (approaching zero). This supports a strong rejection of the null hypothesis of independence and confirms a statistically significant positive correlation between trading volume and volatility, after controlling for market capitalization.
+
+## Volatility Regression Analysis
+
+The final stage of this empirical analysis involves constructing a linear regression model. Acknowledging the stochastic, non-linear, and non-Gaussian nature of financial time series, the primary aim of this Ordinary Least Squares (OLS) specification is not prediction, but structural inference — specifically, to quantify the marginal effects, direction, and statistical significance of exogenous variables. Importantly, such models are best suited to capturing the standard behavior present in the analyzed data, but are inherently limited in their ability to account for rare or extreme values — phenomena that are common in complex financial datasets. As a result, the analysis naturally emphasizes central tendencies, such as median patterns.
+
+Asset return is excluded as the dependent variable due to its mean-reverting nature, high noise-to-signal ratio, and pronounced non-normality. Instead, idiosyncratic volatility is chosen as the dependent variable. To ensure stationarity, maintain positive values, and better approximate normality, the volatility series is logarithmically transformed.
+
+### Data Transformation and Methodological Constraints
+
+Modeling financial volatility poses several econometric challenges, most notably conditional heteroscedasticity and serial correlation. Since volatility is calculated as a 20-day rolling standard deviation, the resulting series displays significant autocorrelation, with each observation highly correlated with its recent past. Additionally, volatility processes are persistent and tend to mean-revert over time.
+
+```{r logarithmising volatility}
+long_dataset$log_volatility <- log(long_dataset$volatility)
+long_dataset_clear <- long_dataset %>% filter(!is.na(log_volatility) & !is.infinite(log_volatility))
+```
+
+To improve robustness of the OLS estimators and normalize continuous variables, trading volume is also log-transformed. This reduces the influence of extreme values and permits interpretation of coefficients as elasticities. Outliers in the log-transformed variables are removed to prevent them from distorting coefficient estimates. Predictors that are deterministically related to the dependent variable — such as raw returns or price levels — are excluded from the model to avoid endogeneity and multicollinearity.
+
+```{r logarithmising volume}
+long_dataset_clear$log_volume <- log(long_dataset_clear$volume)
+long_dataset_clear <- long_dataset_clear %>% filter(!is.na(log_volume) & !is.infinite(log_volume))
+```
+
+```{r log_volume histogram}
+ggplot(long_dataset_clear, aes(x = log_volume)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 bins = 100, fill = "steelblue", color = "black", alpha = 0.7) +
+  labs(title = "Log-volume Distribution Histogram") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+```{r data trimming for model}
+long_dataset_clear_cut <- long_dataset_clear %>% 
+  filter(
+    log_volume >= quantile(log_volume, 0.01, na.rm = TRUE),
+    log_volume <= quantile(log_volume, 0.99, na.rm = TRUE),
+    
+    log_volatility >= quantile(log_volatility, 0.01, na.rm = TRUE),
+    log_volatility <= quantile(log_volatility, 0.99, na.rm = TRUE),
+    
+    log_market_cap >= quantile(log_market_cap, 0.01, na.rm= TRUE),
+    log_market_cap <= quantile(log_market_cap, 0.99, na.rm = TRUE)
+  )
+```
+
+To address serial correlation in the errors, a first-order lagged dependent variable, $\ln(Volatility_{t-1})$, is included in the model. Exploratory analysis reveals a nearly linear relationship between current and lagged volatility. By adopting a dynamic autoregressive model, this temporal dependence is explicitly modeled, reducing omitted variable bias and minimizing residual autocorrelation.
+
+```{r lagged volatility, echo=FALSE, message=FALSE, warning=FALSE}
+long_dataset_for_lm <- long_dataset_clear_cut %>%
+  arrange(region) %>%
+  group_by(ticker) %>%
+  mutate(log_prev_volatility = lag(log_volatility)) %>%
+  filter(!is.na(log_prev_volatility)) %>%
+  ungroup()
+
+ggplot(long_dataset_for_lm, aes(x = log_prev_volatility, y = log_volatility)) + 
+geom_point(alpha = 0.3, size =   0.5) + 
+
+geom_smooth(method = "lm", color = "red", linetype = "dashed") + 
+
+  theme_minimal() +
+  labs(title = "Correlation Between Current and Previous Volatility",
+       subtitle = "Dashed line shows general trend") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+### Empirical Results and Volatility Clustering
+
+The regression results show an Adjusted $R^2$ ($R^2_{adj}$) close to one. This high explanatory power is typical for autoregressive time-series models and supports the structural soundness of the specification.
+
+```{r regression model}
+model <- lm(log_volatility ~ log_prev_volatility + log_market_cap + region + sector + log_volume, data = long_dataset_for_lm)
+
+summary(model)
+```
+
+As expected, the coefficient for the lagged dependent variable ($\ln(Volatility_{t-1})$) accounts for roughly 98% of the model’s explanatory power. This strongly confirms the well-established phenomenon of volatility clustering, where periods of high volatility tend to follow each other, as do periods of low volatility.
+
+### Structural Inference: Covariates and Categorical Effects
+
+Beyond the autoregressive component, the structural covariates yield several significant findings, supporting hypotheses from earlier exploratory analysis:
+
+* **Size Premium and Liquidity:** Market capitalization has a significant negative effect on conditional volatility, confirming that larger firms experience more stable volatility regimes. In contrast, trading volume has a positive conditional effect, supporting the previously observed link between higher trading activity and increased volatility.
+
+* **Regional Fixed Effects:** The model identifies a significant negative premium for the US cohort. After controlling for market capitalization and volume, US equities consistently show lower baseline volatility relative to their European counterparts.
+
+* **Sectoral Fixed Effects:** Sectoral dummies highlight Techn as the most volatile sector, corroborating multidimensional heatmap findings and illustrating the limitations of univariate descriptive statistics in capturing complex sectoral dynamics.
+
+Interestingly, the regression assigns a significant positive coefficient to the Healthcare sector, indicating higher volatility. This finding contradicts earlier univariate analysis, which suggested Healthcare was highly stable. However, due to the marginal significance of this coefficient and possible residual autocorrelation, this sectoral result should be interpreted with caution.
+
+## Model Diagnostics and Robustness Checks
+
+To rigorously assess the reliability of the specified Ordinary Least Squares (OLS) model, a thorough diagnostic analysis of the residuals is essential. Regression coefficients and adjusted $R^2$ offer an initial view of the model’s structural relationships, but true model integrity depends on meeting key econometric assumptions. These are evaluated using standard diagnostic plots.
+
+### Linearity and Conditional Mean (Residuals vs. Fitted Plot)
+
+```{r}
+plot(model, which = 1)
+```
+
+Reviewing the Residuals versus Fitted values plot provides key insights into the linearity assumption. The lowess (locally weighted scatterplot smoothing) trend line remains flat and centered at zero, confirming that the conditional expectation of the residuals is zero ($\mathbb{E}[\epsilon\vert{}X] = 0$). This result indicates that the assumed linear relationship between the predictors and the log-transformed volatility holds well in the data.
+
+However, the scatterplot shows mild heteroscedasticity, with residual variance expanding slightly at higher fitted values. Although heteroscedasticity can affect OLS standard errors and increase Type I error risk, the p-values for significant covariates in this model are extremely small. As a result, this marginal heteroscedasticity does not compromise the robustness of hypothesis testing or undermine the interpretation of structural effects at standard significance levels ($\alpha = 0.05$ or $0.01$).
+
+### Distribution of Error Terms (Normal Q-Q Plot)
+
+```{r}
+plot(model, which = 2)
+mean(residuals(model))
+```
+
+The Quantile-Quantile (Q-Q) plot of standardized residuals assesses the normality assumption. As expected for financial time series, the residuals deviate from normality, especially in the form of heavy tails (leptokurtosis).
+
+Despite this lack of strict normality, the mean of the residuals is effectively zero. More importantly, with a large sample size (47,000 observations), the Central Limit Theorem (CLT) ensures that OLS estimators remain consistent and unbiased. Thus, non-normality in the residuals does not materially affect coefficient estimation.
+
+### Variance Dispersion (Scale-Location Plot)
+
+```{r}
+plot(model, which = 3)
+```
+
+To further evaluate homoscedasticity, the Scale-Location (Spread-Location) plot—mapping the square root of standardized residuals against fitted values—is examined. The trend line shows a slight negative slope as fitted values increase. Residual variance remains stable across most of the data, widening only where data are sparse. This indicates that any departure from homoscedasticity is minor and localized, confirming that standard error estimates remain reliable for structural inference.
+
+### Influential Observations and Leverage (Residuals vs. Leverage Plot)
+
+```{r}
+plot(model, which = 5)
+```
+
+Finally, the Residuals versus Leverage plot is used to identify influential outliers, typically evaluated using Cook's Distance. The plot demonstrates the effectiveness of prior data transformation and trimming procedures.
+
+Of roughly 47,000 observations, only three are identified as high-leverage outliers. Even these points remain close to the main data cluster and do not exceed critical Cook's Distance thresholds. This demonstrates that extreme values and structural outliers have been effectively addressed, ensuring the stability and validity of the final econometric model.
+
+## Conclusion
+
+This report presents a detailed empirical analysis of stock market returns and idiosyncratic volatility using a cross-sectional panel of US and EU equities. By directly accounting for the non-Gaussian characteristics of financial time series, the research brings to light key microstructural forces that shape the behavior of different markets.
+
+The empirical findings provide several important insights. First, the analysis strongly confirms the leptokurtic ("fat-tailed") nature of financial returns, showing that extreme market events are far more common than what would be expected under normal distribution assumptions.
+
+Second, the cross-regional analysis demonstrates that the European equity market experiences consistently higher volatility than the US market. However, after accounting for trading volume and firm size, this difference is shown to be largely driven by a liquidity premium. Small- and mid-cap stocks display pronounced structural heteroscedasticity: despite lower baseline volatility from limited trading and illiquidity, they are highly susceptible to sharp, localized volatility spikes caused by asymmetric information shocks. In contrast, large-cap, liquid markets absorb typical trading flows more efficiently but exhibit higher continuous variance.
+
+The sectoral analysis further highlights a critical distinction between ongoing baseline volatility and exposure to extreme tail risks. The Information Technology sector consistently shows the highest continuous volatility, while the Energy sector, though relatively stable under normal conditions, is marked by sharp, idiosyncratic volatility spikes—often triggered by macroeconomic or geopolitical shocks. This finding underscores that aggregate univariate variance alone cannot fully capture the complex risk dynamics of individual sectors.
+
+The econometric modeling, supported by thorough diagnostic checks, robustly confirms the presence of volatility clustering. The autoregressive model shows that current volatility is highly dependent on its recent history, accounting for about 98% of the variance in the model.
+
+While this research establishes a strong foundational framework, it is subject to some methodological limitations, such as mechanical autocorrelation from rolling-window volatility calculations and dependence on static historical API data. Future studies should build on these results by employing advanced GARCH models or leveraging high-frequency, intraday order-book data to better identify the microstructural drivers of extreme market events.
